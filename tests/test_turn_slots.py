@@ -142,6 +142,63 @@ def test_window_exactly_turn_seconds_fits():
     assert slot.action_end_seconds == pytest.approx(2.0)
 
 
+def test_turn_slightly_longer_than_full_measure_is_infeasible():
+    # 60 BPM、前一小节 1 拍（整窗恰 1 秒）、双手整拍空闲：
+    # turn_seconds=1.0000000005 仅略超窗长，不得因浮点容差误判可行
+    # （旧实现会返回 feasible=True，且动作结束晚于 1 秒边界）
+    r = prepare_rehearsal(2, [1, 1], 60, [], [0, 1])
+    (slot,) = r.turn_slots(
+        hands_busy=[([], []), ([], [])],
+        turn_seconds=1.0000000005,
+    )
+    assert slot.boundary_seconds == pytest.approx(1.0)
+    assert slot.feasible is False
+    assert slot.hand is None
+    assert slot.action_start_seconds is None
+    assert slot.action_end_seconds is None
+
+
+def test_turn_exactly_filling_one_beat_measure_fits():
+    # 同一时间轴下 turn_seconds=1.0 恰好填满整窗：可行，左手优先，
+    # 动作占满整窗（0.0~1.0，恰在边界处完成）
+    r = prepare_rehearsal(2, [1, 1], 60, [], [0, 1])
+    (slot,) = r.turn_slots(hands_busy=[([], []), ([], [])], turn_seconds=1.0)
+    assert slot.feasible is True
+    assert slot.hand == "left"
+    assert slot.action_start_seconds == pytest.approx(0.0)
+    assert slot.action_end_seconds == pytest.approx(1.0)
+
+
+def test_turn_slightly_shorter_than_window_fits_at_latest_start():
+    # turn_seconds=0.9999999999 略短于 1 秒整窗：可行，最晚开始使动作
+    # 恰在 1 秒边界结束（开始于 0.0000000001）
+    r = prepare_rehearsal(2, [1, 1], 60, [], [0, 1])
+    (slot,) = r.turn_slots(
+        hands_busy=[([], []), ([], [])],
+        turn_seconds=0.9999999999,
+    )
+    assert slot.feasible is True
+    assert slot.hand == "left"
+    assert slot.action_start_seconds == pytest.approx(0.0000000001)
+    assert slot.action_end_seconds == pytest.approx(1.0)
+    assert slot.action_end_seconds <= slot.boundary_seconds + 1e-12
+
+
+def test_busy_window_slightly_short_of_turn_is_infeasible():
+    # 2 拍小节（60 BPM -> 2 秒），双手均忙 [0,1)：空闲窗恰 1 秒，
+    # turn_seconds=1.0000000005 略超 -> 不可行；边界保留、动作字段置空
+    r = prepare_rehearsal(2, [2, 2], 60, [], [0, 1])
+    (slot,) = r.turn_slots(
+        hands_busy=[([[0, 1]], [[0, 1]]), ([], [])],
+        turn_seconds=1.0000000005,
+    )
+    assert slot.boundary_seconds == pytest.approx(2.0)
+    assert slot.feasible is False
+    assert slot.hand is None
+    assert slot.action_start_seconds is None
+    assert slot.action_end_seconds is None
+
+
 def test_infeasible_boundary_is_kept_and_marked():
     # 双手全忙：边界保留，标记不可行，动作字段为 None
     r = _single_boundary_rehearsal()

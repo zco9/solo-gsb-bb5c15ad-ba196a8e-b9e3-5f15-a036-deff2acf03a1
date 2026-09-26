@@ -129,6 +129,56 @@ def test_turn_slots_left_preferred_on_tie(client):
     assert slot["action_end_seconds"] == pytest.approx(4.0)
 
 
+def _create_two_page_plan(client) -> str:
+    # 分页结果：页 1 = 小节 0（高度恰满页），页 2 = 小节 1
+    resp = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [3, 3],
+            "silence_seconds": [2, 0],
+            "page_height": 3,
+            "min_turn_time": 1,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_turn_slots_near_boundary_turn_seconds(client):
+    plan_id = _create_two_page_plan(client)
+    base_payload = {
+        "beats_per_measure": [1, 1],  # 60 BPM -> 前一小节整窗恰 1 秒
+        "tempo_bpm": 60,
+        "repeats": [],
+        "hands_busy": [{"left": [], "right": []}] * 2,
+    }
+
+    # turn_seconds 仅略超 1 秒窗长：边界保留但不可行，动作字段为 null
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/turn-slots",
+        json={**base_payload, "turn_seconds": 1.0000000005},
+    )
+    assert resp.status_code == 200, resp.text
+    (slot,) = resp.json()["slots"]
+    assert slot["boundary_seconds"] == pytest.approx(1.0)
+    assert slot["feasible"] is False
+    assert slot["hand"] is None
+    assert slot["action_start_seconds"] is None
+    assert slot["action_end_seconds"] is None
+
+    # 恰好填满整窗仍可行：左手优先，动作 0.0~1.0 恰在边界处完成
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/turn-slots",
+        json={**base_payload, "turn_seconds": 1.0},
+    )
+    assert resp.status_code == 200, resp.text
+    (slot,) = resp.json()["slots"]
+    assert slot["feasible"] is True
+    assert slot["hand"] == "left"
+    assert slot["action_start_seconds"] == pytest.approx(0.0)
+    assert slot["action_end_seconds"] == pytest.approx(1.0)
+
+
 def test_turn_slots_plan_not_found(client):
     resp = _slots(client, "does-not-exist")
     assert resp.status_code == 404

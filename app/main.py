@@ -419,7 +419,11 @@ class TurnSlotOut(BaseModel):
         ..., description="后一小节所属重复段内第几遍（1 基）；非重复段为 1"
     )
     feasible: bool = Field(
-        ..., description="是否找到能容纳完整翻页动作的连续空闲窗"
+        ...,
+        description=(
+            "是否找到能容纳完整翻页动作的连续空闲窗；窗时长恰好等于动作"
+            "时长也算可行（动作恰好填满整窗），按请求十进制值精确比较"
+        ),
     )
     hand: Optional[str] = Field(
         None, description="执行翻页的手：left 或 right；不可行为 null"
@@ -444,8 +448,10 @@ class RehearsalTurnSlotsResponse(BaseModel):
 
 
 def _slot_to_out(slot: TurnSlot) -> TurnSlotOut:
+    # 核心逻辑全程使用精确有理数（Fraction）；只在此响应出口转回 float，
+    # 转换不参与任何可行性判定
     return TurnSlotOut(
-        boundary_seconds=slot.boundary_seconds,
+        boundary_seconds=float(slot.boundary_seconds),
         from_page=slot.from_page,
         to_page=slot.to_page,
         from_measure=slot.from_measure,
@@ -454,8 +460,14 @@ def _slot_to_out(slot: TurnSlot) -> TurnSlotOut:
         to_playthrough=slot.to_playthrough,
         feasible=slot.feasible,
         hand=slot.hand,
-        action_start_seconds=slot.action_start_seconds,
-        action_end_seconds=slot.action_end_seconds,
+        action_start_seconds=(
+            None if slot.action_start_seconds is None
+            else float(slot.action_start_seconds)
+        ),
+        action_end_seconds=(
+            None if slot.action_end_seconds is None
+            else float(slot.action_end_seconds)
+        ),
     )
 
 
@@ -1217,6 +1229,12 @@ def plan_rehearsal_turn_slots(
     相邻演奏小节跨页的边界，在前一个演奏小节内按左右手忙碌区间求连续
     空闲窗，挑选能容纳完整翻页动作（turn_seconds）的最晚开始时刻，左右
     手并列时优先左手；找不到可用窗的边界保留在结果中并标记为不可行。
+
+    忙碌区间端点、拍数、速度与 turn_seconds 均按请求的十进制字面量构造
+    有理数，忙碌区间补集、空闲窗时长比较与最晚开始时刻全程精确计算，
+    不使用浮点容差：空闲窗时长恰好等于 turn_seconds 仍可行（动作恰好填满
+    整窗），略短即不可行，故可行动作的结束时刻绝不晚于跨页边界；秒数只
+    在响应出口转回 float。
     """
     assert store is not None
     record = store.get(plan_id)

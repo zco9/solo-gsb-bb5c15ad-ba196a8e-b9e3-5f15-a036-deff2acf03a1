@@ -43,7 +43,7 @@ def test_slots_through_repeated_segment():
         ],
         turn_seconds=1.0,
     )
-    assert [s.boundary_seconds for s in slots] == [4.0, 6.0, 8.0]
+    assert [float(s.boundary_seconds) for s in slots] == [4.0, 6.0, 8.0]
 
     first, backward, second_forward = slots
 
@@ -53,8 +53,8 @@ def test_slots_through_repeated_segment():
     assert (first.from_page, first.to_page) == (1, 2)
     assert first.feasible is True
     assert first.hand == "right"
-    assert first.action_start_seconds == pytest.approx(3.0)
-    assert first.action_end_seconds == pytest.approx(4.0)
+    assert float(first.action_start_seconds) == pytest.approx(3.0)
+    assert float(first.action_end_seconds) == pytest.approx(4.0)
 
     # 回跳边界：前一小节 2 遍1 左手全闲，最晚开始 1.0（动作 [5.0, 6.0]）
     assert (backward.from_measure, backward.from_playthrough) == (2, 1)
@@ -62,14 +62,14 @@ def test_slots_through_repeated_segment():
     assert (backward.from_page, backward.to_page) == (2, 1)
     assert backward.feasible is True
     assert backward.hand == "left"
-    assert backward.action_start_seconds == pytest.approx(5.0)
-    assert backward.action_end_seconds == pytest.approx(6.0)
+    assert float(backward.action_start_seconds) == pytest.approx(5.0)
+    assert float(backward.action_end_seconds) == pytest.approx(6.0)
 
     # 第二遍的小节 1 复用同一小节的忙碌区间
     assert (second_forward.from_measure, second_forward.from_playthrough) == (1, 2)
     assert second_forward.hand == "right"
-    assert second_forward.action_start_seconds == pytest.approx(7.0)
-    assert second_forward.action_end_seconds == pytest.approx(8.0)
+    assert float(second_forward.action_start_seconds) == pytest.approx(7.0)
+    assert float(second_forward.action_end_seconds) == pytest.approx(8.0)
 
 
 def test_action_stays_within_preceding_measure():
@@ -81,7 +81,8 @@ def test_action_stays_within_preceding_measure():
     assert len(slots) == 3
     for slot in slots:
         assert slot.feasible is True
-        assert slot.action_end_seconds <= slot.boundary_seconds + 1e-9
+        # 精确有理数：可行动作结束时刻绝不晚于边界（无容差）
+        assert slot.action_end_seconds <= slot.boundary_seconds
 
 
 def test_latest_window_wins():
@@ -92,8 +93,8 @@ def test_latest_window_wins():
         turn_seconds=0.5,
     )
     assert slot.hand == "left"
-    assert slot.action_start_seconds == pytest.approx(1.5)
-    assert slot.action_end_seconds == pytest.approx(2.0)
+    assert float(slot.action_start_seconds) == pytest.approx(1.5)
+    assert float(slot.action_end_seconds) == pytest.approx(2.0)
 
 
 def test_left_preferred_on_tie():
@@ -102,8 +103,8 @@ def test_left_preferred_on_tie():
     (slot,) = r.turn_slots(hands_busy=[([], []), ([], [])], turn_seconds=1.0)
     assert slot.feasible is True
     assert slot.hand == "left"
-    assert slot.action_start_seconds == pytest.approx(1.0)
-    assert slot.action_end_seconds == pytest.approx(2.0)
+    assert float(slot.action_start_seconds) == pytest.approx(1.0)
+    assert float(slot.action_end_seconds) == pytest.approx(2.0)
 
 
 def test_right_chosen_when_strictly_later():
@@ -114,7 +115,7 @@ def test_right_chosen_when_strictly_later():
         turn_seconds=1.0,
     )
     assert slot.hand == "right"
-    assert slot.action_start_seconds == pytest.approx(1.0)
+    assert float(slot.action_start_seconds) == pytest.approx(1.0)
 
 
 def test_unsorted_and_overlapping_intervals_are_merged():
@@ -125,8 +126,8 @@ def test_unsorted_and_overlapping_intervals_are_merged():
         turn_seconds=0.5,
     )
     assert slot.hand == "left"
-    assert slot.action_start_seconds == pytest.approx(1.0)
-    assert slot.action_end_seconds == pytest.approx(1.5)
+    assert float(slot.action_start_seconds) == pytest.approx(1.0)
+    assert float(slot.action_end_seconds) == pytest.approx(1.5)
 
 
 def test_window_exactly_turn_seconds_fits():
@@ -138,8 +139,48 @@ def test_window_exactly_turn_seconds_fits():
     )
     assert slot.feasible is True
     assert slot.hand == "left"
-    assert slot.action_start_seconds == pytest.approx(1.0)
-    assert slot.action_end_seconds == pytest.approx(2.0)
+    assert float(slot.action_start_seconds) == pytest.approx(1.0)
+    assert float(slot.action_end_seconds) == pytest.approx(2.0)
+
+
+def test_turn_marginally_longer_than_full_measure_is_infeasible():
+    # 60 BPM、前一小节 1 拍、双手整拍空闲：整窗恰为 1 秒，
+    # turn_seconds 仅大 5e-10 秒也必须判不可行——动作不得越过 1 秒边界
+    r = prepare_rehearsal(
+        measure_count=2,
+        beats_per_measure=[1, 1],
+        tempo_bpm=60,
+        repeats=[],
+        page_starts=(0, 1),
+    )
+    (slot,) = r.turn_slots(
+        hands_busy=[([], []), ([], [])],
+        turn_seconds=1.0000000005,
+    )
+    assert slot.boundary_seconds == 1
+    assert slot.feasible is False
+    assert slot.hand is None
+    assert slot.action_start_seconds is None
+    assert slot.action_end_seconds is None
+
+
+def test_turn_marginally_shorter_ends_exactly_on_boundary():
+    # 同一整拍空闲窗：turn_seconds 略短于 1 秒时可行，动作恰在边界结束
+    r = prepare_rehearsal(
+        measure_count=2,
+        beats_per_measure=[1, 1],
+        tempo_bpm=60,
+        repeats=[],
+        page_starts=(0, 1),
+    )
+    (slot,) = r.turn_slots(
+        hands_busy=[([], []), ([], [])],
+        turn_seconds=0.9999999995,
+    )
+    assert slot.feasible is True
+    assert slot.hand == "left"
+    assert slot.action_end_seconds == slot.boundary_seconds
+    assert float(slot.action_start_seconds) == pytest.approx(0.0000000005)
 
 
 def test_infeasible_boundary_is_kept_and_marked():
@@ -149,7 +190,7 @@ def test_infeasible_boundary_is_kept_and_marked():
         hands_busy=[([[0, 4]], [[0, 4]]), ([], [])],
         turn_seconds=1.0,
     )
-    assert slot.boundary_seconds == pytest.approx(2.0)
+    assert float(slot.boundary_seconds) == pytest.approx(2.0)
     assert slot.feasible is False
     assert slot.hand is None
     assert slot.action_start_seconds is None
@@ -173,11 +214,11 @@ def test_no_repeats_single_boundary():
     slots = r.turn_slots([([], []), ([], [[0, 4]]), ([], []), ([], [])], 1.0)
     assert len(slots) == 1
     slot = slots[0]
-    assert slot.boundary_seconds == pytest.approx(4.0)
+    assert float(slot.boundary_seconds) == pytest.approx(4.0)
     assert (slot.from_measure, slot.to_measure) == (1, 2)
     assert (slot.from_playthrough, slot.to_playthrough) == (1, 1)
     assert slot.hand == "left"
-    assert slot.action_start_seconds == pytest.approx(3.0)
+    assert float(slot.action_start_seconds) == pytest.approx(3.0)
 
 
 def test_slots_follow_tempo_and_beats():
@@ -187,10 +228,10 @@ def test_slots_follow_tempo_and_beats():
         hands_busy=[([[0, 1]], []), ([], [])],  # 左手闲 [1,3) = 2 秒
         turn_seconds=1.5,
     )
-    assert slot.boundary_seconds == pytest.approx(3.0)
+    assert float(slot.boundary_seconds) == pytest.approx(3.0)
     assert slot.hand == "left"
-    assert slot.action_start_seconds == pytest.approx(1.5)
-    assert slot.action_end_seconds == pytest.approx(3.0)
+    assert float(slot.action_start_seconds) == pytest.approx(1.5)
+    assert float(slot.action_end_seconds) == pytest.approx(3.0)
 
 
 def test_hands_busy_length_mismatch():

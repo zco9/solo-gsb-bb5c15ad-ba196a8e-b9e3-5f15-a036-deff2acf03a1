@@ -119,6 +119,66 @@ def test_turn_slots_infeasible_boundary_kept(client):
         assert slot["action_end_seconds"] is None
 
 
+def test_turn_slots_marginally_too_long_turn_is_infeasible(client):
+    # 两小节方案、断页在小节 1：60 BPM 且前一小节只有 1 拍，双手整拍空闲
+    # 时整窗恰为 1 秒；turn_seconds 仅大 5e-10 秒也必须判不可行，边界保留
+    resp = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1, 1],
+            "silence_seconds": [5, 0],
+            "page_height": 1,
+            "min_turn_time": 2,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    plan_id = resp.json()["id"]
+
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/turn-slots",
+        json={
+            "beats_per_measure": [1, 1],
+            "tempo_bpm": 60,
+            "repeats": [],
+            "turn_seconds": 1.0000000005,
+            "hands_busy": [
+                {"left": [], "right": []},
+                {"left": [], "right": []},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    slots = resp.json()["slots"]
+    assert len(slots) == 1
+    slot = slots[0]
+    assert slot["boundary_seconds"] == pytest.approx(1.0)
+    assert slot["feasible"] is False
+    assert slot["hand"] is None
+    assert slot["action_start_seconds"] is None
+    assert slot["action_end_seconds"] is None
+
+    # 恰好 1 秒：可行，左手优先，动作 [0.0, 1.0] 恰好填满整窗
+    resp_ok = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/turn-slots",
+        json={
+            "beats_per_measure": [1, 1],
+            "tempo_bpm": 60,
+            "repeats": [],
+            "turn_seconds": 1.0,
+            "hands_busy": [
+                {"left": [], "right": []},
+                {"left": [], "right": []},
+            ],
+        },
+    )
+    assert resp_ok.status_code == 200, resp_ok.text
+    (slot_ok,) = resp_ok.json()["slots"]
+    assert slot_ok["feasible"] is True
+    assert slot_ok["hand"] == "left"
+    assert slot_ok["action_start_seconds"] == pytest.approx(0.0)
+    assert slot_ok["action_end_seconds"] == pytest.approx(1.0)
+
+
 def test_turn_slots_left_preferred_on_tie(client):
     plan_id = _create_plan(client)
     resp = _slots(client, plan_id, hands_busy=[{}] * 4, repeats=[])

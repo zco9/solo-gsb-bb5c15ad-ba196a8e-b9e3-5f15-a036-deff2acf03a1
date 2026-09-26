@@ -15,17 +15,24 @@
 
 精确时间轴（不使用浮点累加或 epsilon）
 ====================================
-每小节拍数与速度（BPM）先按已校验数值的**十进制字面量**构造有理数
-（``Fraction(str(x))``），重复段展开后的各次发声累计时刻、总时长与拍数
-偏移都据此做精确有理数计算；时间戳同样按十进制字面量转换后比较：
+每小节拍数、速度（BPM）与忙碌区间端点（拍）、翻页秒数都先按已校验数值的
+**十进制字面量**构造有理数（``Fraction(str(x))``），重复段展开后的各次发声
+累计时刻、总时长、拍数偏移与翻页空档的忙碌区间补集、空闲窗时长比较、最晚
+开始时刻均据此做精确有理数计算；外部传入的时间戳同样按十进制字面量转换后
+比较：
 
 - 时间区间左闭右开：只有恰好等于某次发声起点才进入下一次发声——两小节
   各 1 拍、60 BPM 时 0.9999999995 秒仍归第一小节（拍偏移 0.9999999995，
   不会提前归入第二小节而出现负拍偏移）；
 - 严格早于总时长的时间戳仍可定位（1.9999999995 秒对总时长 2 秒可定位），
   等于或超过总时长报错；
-- 与 :mod:`app.pedal_audit` 的精确时间轴同口径；只有结果出口把有理数转回
-  float（响应仍为 JSON number），转换不参与任何判定。
+- 翻页空档只有当完整动作（含 turn_seconds 略大于窗时长的情形，如 1 拍小节
+  60 BPM 配 1.0000000005 秒）**完整落在**某只手的连续空闲窗内才可行：
+  空闲窗时长恰等于翻页秒数仍可行（动作恰好填满整窗），短一丝都不可行，
+  因此可行动作的结束时刻绝不会晚于跨页边界；
+- 与 :mod:`app.pedal_audit` 的精确时间轴同口径；只有结果出口（响应模型与
+  dataclass 的 float 字段）把有理数转回 float（响应仍为 JSON number），
+  转换不参与任何判定。
 
 本模块仅依赖标准库，便于脱离 Web 层直接单测。
 """
@@ -37,17 +44,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 from typing import List, Optional, Sequence, Tuple
-
-
-def _eps(magnitude: float) -> float:
-    """随数量级缩放的浮点容差，仅用于翻页空档的空闲窗拟合。
-
-    时间轴判定（累计时长、区间归属、拍偏移）全部走精确有理数，不使用本
-    容差；只有 :func:`_latest_slot_start` 在浮点窗长与翻页秒数比较时用它
-    抹平换算噪声。用户直接输入的静默秒数与最低翻页时间比较走
-    :func:`_silence_sufficient` 的十进制精确口径，与规划核心一致。
-    """
-    return 1e-9 * max(1.0, abs(magnitude))
 
 
 def _silence_sufficient(silence: float, min_turn_time: float) -> bool:
@@ -141,13 +137,14 @@ class TurnSlot:
     :param to_playthrough: 后一小节所属重复段内第几遍（1 基）
     :param feasible: 是否找到能容纳完整翻页动作的连续空闲窗
     :param hand: 执行翻页的手（``"left"`` 或 ``"right"``）；不可行为 None
-    :param action_start_seconds: 翻页动作开始时刻（秒，以演奏开始为 0）；
-        不可行为 None
-    :param action_end_seconds: 翻页动作结束时刻（秒，以演奏开始为 0）；
-        不可行为 None
+    :param action_start_seconds: 翻页动作开始时刻（秒，以演奏开始为 0）的
+        精确有理数；不可行为 None
+    :param action_end_seconds: 翻页动作结束时刻（秒，以演奏开始为 0）的
+        精确有理数；不可行为 None。时间字段全程保留有理数，只在响应出口
+        （``_slot_to_out``）转回 float。
     """
 
-    boundary_seconds: float
+    boundary_seconds: Fraction
     from_page: int
     to_page: int
     from_measure: int
@@ -156,8 +153,8 @@ class TurnSlot:
     to_playthrough: int
     feasible: bool
     hand: Optional[str]
-    action_start_seconds: Optional[float]
-    action_end_seconds: Optional[float]
+    action_start_seconds: Optional[Fraction]
+    action_end_seconds: Optional[Fraction]
 
 
 # (起始小节, 结束小节, 演奏次数)，小节均为 0 基、两端皆含
@@ -233,8 +230,10 @@ def expand_repeats(
     return events
 
 
-# (起拍, 止拍)，左闭右开，单位：拍
+# (起始拍, 结束拍)，左闭右开，单位：拍
 BusyInterval = Tuple[float, float]
+# 校验后按十进制字面量构造的精确有理数忙碌区间（拍）
+ExactBusyInterval = Tuple[Fraction, Fraction]
 # 每小节的双手忙碌区间：(左手区间序列, 右手区间序列)
 MeasureBusy = Tuple[Sequence[BusyInterval], Sequence[BusyInterval]]
 
@@ -243,10 +242,14 @@ def _normalize_busy_intervals(
     measure_index: int,
     hand_name: str,
     intervals: Sequence[BusyInterval],
-    beats: float,
-) -> List[BusyInterval]:
-    """校验单只手在一个小节内的忙碌区间，返回浮点 (起拍, 止拍) 列表。"""
-    checked: List[BusyInterval] = []
+    beats: Fraction,
+) -> List[ExactBusyInterval]:
+    """校验单只手在一个小节内的忙碌区间，返回精确有理数 (起拍, 止拍) 列表。
+
+    端点按输入数值的十进制字面量构造有理数，后续的区间合并、补集与窗长
+    比较全程使用精确有理数，不做浮点换算。
+    """
+    checked: List[ExactBusyInterval] = []
     for j, interval in enumerate(intervals):
         try:
             start, end = interval
@@ -277,20 +280,21 @@ def _normalize_busy_intervals(
                 f"第 {measure_index + 1} 小节{hand_name}第 {j + 1} 个忙碌区间"
                 f" [{start_f:g}, {end_f:g}) 必须满足 0 ≤ 起拍 < 止拍"
             )
-        if end_f > beats:
+        start_exact, end_exact = _decimal_fraction(start_f), _decimal_fraction(end_f)
+        if end_exact > beats:
             raise RehearsalError(
                 f"第 {measure_index + 1} 小节{hand_name}第 {j + 1} 个忙碌区间"
-                f"止拍 {end_f:g} 超过该小节拍数 {beats:g}"
+                f"止拍 {end_f:g} 超过该小节拍数 {float(beats):g}"
             )
-        checked.append((start_f, end_f))
+        checked.append((start_exact, end_exact))
     return checked
 
 
 def _normalize_hands_busy(
     measure_count: int,
-    beats_per_measure: Sequence[float],
+    beats_per_measure: Sequence[Fraction],
     hands_busy: Sequence[MeasureBusy],
-) -> List[Tuple[List[BusyInterval], List[BusyInterval]]]:
+) -> List[Tuple[List[ExactBusyInterval], List[ExactBusyInterval]]]:
     """校验每小节双手忙碌区间，整理成 (左手区间, 右手区间) 列表。
 
     区间允许乱序与重叠（合并在 _free_windows 中进行）；端点须为有限数值
@@ -301,7 +305,9 @@ def _normalize_hands_busy(
             f"hands_busy 数组长度（{len(hands_busy)}）"
             f"与规划小节数（{measure_count}）不符"
         )
-    normalized: List[Tuple[List[BusyInterval], List[BusyInterval]]] = []
+    normalized: List[
+        Tuple[List[ExactBusyInterval], List[ExactBusyInterval]]
+    ] = []
     for i, per_measure in enumerate(hands_busy):
         try:
             left, right = per_measure
@@ -319,18 +325,22 @@ def _normalize_hands_busy(
 
 
 def _free_windows(
-    busy: Sequence[BusyInterval], beats: float
-) -> List[BusyInterval]:
-    """忙碌区间（允许乱序、重叠）合并后取补集，返回 [0, beats] 内的空闲窗。"""
-    merged: List[List[float]] = []
+    busy: Sequence[ExactBusyInterval], beats: Fraction
+) -> List[ExactBusyInterval]:
+    """忙碌区间（允许乱序、重叠）合并后取补集，返回 [0, beats] 内的空闲窗。
+
+    全程精确有理数：恰相接（前一区间止拍等于后一区间起拍）也会合并，
+    端点相等时不会产生零长空窗。
+    """
+    merged: List[List[Fraction]] = []
     for start, end in sorted(busy):
         if merged and start <= merged[-1][1]:
             if end > merged[-1][1]:
                 merged[-1][1] = end
         else:
             merged.append([start, end])
-    windows: List[BusyInterval] = []
-    cursor = 0.0
+    windows: List[ExactBusyInterval] = []
+    cursor = Fraction(0)
     for start, end in merged:
         if start > cursor:
             windows.append((cursor, start))
@@ -342,24 +352,24 @@ def _free_windows(
 
 
 def _latest_slot_start(
-    busy: Sequence[BusyInterval],
-    beats: float,
-    seconds_per_beat: float,
-    turn_seconds: float,
-) -> Optional[float]:
+    busy: Sequence[ExactBusyInterval],
+    beats: Fraction,
+    seconds_per_beat: Fraction,
+    turn_seconds: Fraction,
+) -> Optional[Fraction]:
     """单手在该小节内能容纳完整翻页动作的最晚开始时刻（相对小节起点，秒）。
 
-    空闲窗 [ws, we)（拍）能容纳完整动作当且仅当其时长不少于 turn_seconds；
-    窗内最晚开始即动作恰在窗尾结束：we 对应时刻减 turn_seconds。遍历所有
-    空闲窗取最大者；无可用窗返回 None。
+    空闲窗 [ws, we)（拍）能容纳完整动作当且仅当其时长（精确换算成秒）
+    **不少于** turn_seconds——恰好等于视为可行，动作恰好填满整窗；短于
+    （哪怕只短一个最小尾数）即不可行，不使用任何浮点容差。窗内最晚开始
+    即动作恰在窗尾结束：``we × 每拍秒数 − turn_seconds``，该时刻必然不早
+    于窗起点。遍历所有空闲窗取最大者；无可用窗返回 None。
     """
-    latest: Optional[float] = None
+    latest: Optional[Fraction] = None
     for w_start, w_end in _free_windows(busy, beats):
-        if (w_end - w_start) * seconds_per_beat + _eps(turn_seconds) < turn_seconds:
+        if (w_end - w_start) * seconds_per_beat < turn_seconds:
             continue
         start = w_end * seconds_per_beat - turn_seconds
-        # 容差放行时动作起点可能略低于窗起点，钳回窗内
-        start = max(start, w_start * seconds_per_beat)
         if latest is None or start > latest:
             latest = start
     return latest
@@ -376,12 +386,13 @@ class Rehearsal:
 
     measure_count: int
     tempo_bpm: float
-    beats_per_measure: Tuple[float, ...]  # 每个原谱小节的拍数（已校验为正）
+    beats_per_measure: Tuple[float, ...]  # 每个原谱小节的拍数（float 视图）
     events: List[PlayedMeasure]
     page_starts: Tuple[int, ...]  # 每页起始原谱小节（0 基，升序，首个为 0）
     start_times_exact: Tuple[Fraction, ...]  # start_times_exact[k]：第 k 次发声的精确开始时刻
     total_duration_exact: Fraction  # 重复段展开后的精确演奏总时长
     seconds_per_beat_exact: Fraction  # 每拍秒数（60 / 速度）的精确值
+    beats_per_measure_exact: Tuple[Fraction, ...]  # 每个原谱小节拍数的精确值（十进制字面量）
 
     @property
     def start_times(self) -> List[float]:
@@ -505,6 +516,12 @@ class Rehearsal:
         开始时刻，左右手的最晚开始并列时优先左手。找不到可用窗的边界
         保留在结果中并标记为不可行。
 
+        忙碌区间端点与 turn_seconds 都按输入数值的十进制字面量构造有理数，
+        忙碌区间补集、空闲窗时长比较、最晚开始时刻与动作起止时刻全程精确
+        计算（不使用浮点容差）：空闲窗时长恰等于 turn_seconds 仍可行
+        （动作恰好填满整窗），短一丝即不可行，故可行动作的结束时刻绝不
+        晚于跨页边界。结果秒数只在响应出口转回 float。
+
         :param hands_busy: 每个原谱小节的 (左手忙碌区间, 右手忙碌区间)，
             区间为 (起拍, 止拍)、左闭右开，允许乱序与重叠；长度必须等于
             规划小节数
@@ -522,11 +539,14 @@ class Rehearsal:
             raise RehearsalError(
                 f"turn_seconds（完整翻页动作所需秒数）必须为正数（实际 {turn:g}）"
             )
+        # 翻页秒数按十进制字面量构造精确有理数；忙碌区间端点同理，窗时长
+        # 比较与最晚开始时刻全程精确，不做浮点换算或容差抹平
+        turn_exact = _decimal_fraction(turn)
         normalized = _normalize_hands_busy(
-            self.measure_count, self.beats_per_measure, hands_busy
+            self.measure_count, self.beats_per_measure_exact, hands_busy
         )
 
-        seconds_per_beat = float(self.seconds_per_beat_exact)
+        seconds_per_beat = self.seconds_per_beat_exact
         starts = self.start_times_exact
         slots: List[TurnSlot] = []
         for k in range(len(self.events) - 1):
@@ -535,18 +555,18 @@ class Rehearsal:
             to_page = self.page_of(nxt.measure)
             if from_page == to_page:
                 continue
-            beats = self.beats_per_measure[prev.measure]
+            beats = self.beats_per_measure_exact[prev.measure]
             left_busy, right_busy = normalized[prev.measure]
             left_start = _latest_slot_start(
-                left_busy, beats, seconds_per_beat, turn
+                left_busy, beats, seconds_per_beat, turn_exact
             )
             right_start = _latest_slot_start(
-                right_busy, beats, seconds_per_beat, turn
+                right_busy, beats, seconds_per_beat, turn_exact
             )
 
-            # 最晚开始时刻并列时优先左手
+            # 最晚开始时刻并列时优先左手（有理数精确比较，不存在"近似并列"）
             hand: Optional[str] = None
-            start_rel: Optional[float] = None
+            start_rel: Optional[Fraction] = None
             if left_start is not None and (
                 right_start is None or left_start >= right_start
             ):
@@ -554,14 +574,14 @@ class Rehearsal:
             elif right_start is not None:
                 hand, start_rel = "right", right_start
 
-            action_start: Optional[float] = None
-            action_end: Optional[float] = None
+            action_start: Optional[Fraction] = None
+            action_end: Optional[Fraction] = None
             if start_rel is not None:
-                action_start = float(starts[k]) + start_rel
-                action_end = action_start + turn
+                action_start = starts[k] + start_rel
+                action_end = action_start + turn_exact
             slots.append(
                 TurnSlot(
-                    boundary_seconds=float(starts[k + 1]),
+                    boundary_seconds=starts[k + 1],
                     from_page=from_page,
                     to_page=to_page,
                     from_measure=prev.measure,
@@ -628,14 +648,13 @@ def prepare_rehearsal(
     # 精确有理数时间轴：拍数与速度按已校验数值的十进制字面量构造，
     # 重复段展开后的累计发声时刻与总时长均为精确前缀和（不做浮点累加）
     beats_tuple = tuple(float(b) for b in beats_per_measure)
+    beats_exact = tuple(_decimal_fraction(b) for b in beats_tuple)
     seconds_per_beat_exact = Fraction(60) / _decimal_fraction(tempo)
     start_times_exact: List[Fraction] = []
     elapsed = Fraction(0)
     for event in events:
         start_times_exact.append(elapsed)
-        elapsed += (
-            _decimal_fraction(beats_tuple[event.measure]) * seconds_per_beat_exact
-        )
+        elapsed += beats_exact[event.measure] * seconds_per_beat_exact
 
     return Rehearsal(
         measure_count=measure_count,
@@ -646,4 +665,5 @@ def prepare_rehearsal(
         start_times_exact=tuple(start_times_exact),
         total_duration_exact=elapsed,
         seconds_per_beat_exact=seconds_per_beat_exact,
+        beats_per_measure_exact=beats_exact,
     )
